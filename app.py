@@ -25,36 +25,85 @@ import ev_core as core
 st.set_page_config(page_title="EV Route Planner", page_icon="⚡", layout="wide")
 
 # --------------------------------------------------------------------------- #
-# Sidebar — inputs
+# Cached data access — identical inputs never re-hit the free public APIs.
 # --------------------------------------------------------------------------- #
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def find_places(query: str) -> list[core.Place]:
+    """Geocode candidates, cached for an hour per query string."""
+    return core.geocode_candidates(query)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def find_route(s_lat: float, s_lon: float,
+               e_lat: float, e_lon: float) -> core.Route | None:
+    """Driving route between two coordinate pairs, cached for an hour."""
+    return core.get_route(core.Place("start", s_lat, s_lon),
+                          core.Place("end", e_lat, e_lon))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def plan_trip(route: core.Route, api_key: str, range_km: float,
+              start_soc: float, corridor_km: float, min_power: float,
+              battery_kwh: float) -> core.TripPlan:
+    """Full trip plan. Short TTL: wait estimates are time-of-day dependent."""
+    return core.build_trip(route, api_key, range_km, start_soc=start_soc,
+                           corridor_km=corridor_km, min_power_kw=min_power,
+                           battery_kwh=battery_kwh)
+
+
+# --------------------------------------------------------------------------- #
+# Sidebar — inputs (a form, so edits only apply when "Plan trip" is pressed)
+# --------------------------------------------------------------------------- #
+
+# The key stays server-side: when configured in secrets it is used directly
+# and never rendered into a widget, so visitors can't see it.
+try:
+    secret_key = st.secrets.get("ocm_api_key", "")
+except (FileNotFoundError, st.errors.StreamlitAPIException):
+    secret_key = ""
 
 with st.sidebar:
     st.title("⚡ EV Route Planner")
     st.caption("Charging stops & wait estimates along your trip.")
 
-    start_q = st.text_input("Start", value="Cape Town, South Africa")
-    end_q = st.text_input("Destination", value="Bloemfontein, South Africa")
+    with st.form("trip_form"):
+        start_q = st.text_input("Start", value="Cape Town, South Africa")
+        end_q = st.text_input("Destination", value="Bloemfontein, South Africa")
 
-    st.subheader("Your EV")
-    range_km = st.slider("Full range (km)", 150, 700, 350, step=10,
-                         help="Rated range on a full charge.")
-    start_soc = st.slider("Starting charge (%)", 30, 100, 90, step=5) / 100.0
+        st.subheader("Your EV")
+        range_km = st.slider("Full range (km)", 150, 700, 350, step=10,
+                             help="Rated range on a full charge.")
+        battery_kwh = st.slider("Battery capacity (kWh)", 20, 150, 64,
+                                help="Used to estimate charging time from "
+                                     "the energy actually needed.")
+        start_soc = st.slider("Starting charge (%)", 30, 100, 90, step=5) / 100.0
 
-    st.subheader("Charging preferences")
-    min_power = st.select_slider(
-        "Minimum charger speed for stops (kW)",
-        options=[22, 50, 100, 150, 350], value=50,
-        help="Only use chargers at or above this power for planned stops.")
-    corridor_km = st.slider("Search corridor around route (km)", 2, 25, 8,
-                            help="How far off the route to look for chargers.")
+        st.subheader("Charging preferences")
+        min_power = st.select_slider(
+            "Minimum charger speed for stops (kW)",
+            options=[22, 50, 100, 150, 350], value=50,
+            help="Only use chargers at or above this power for planned stops.")
+        corridor_km = st.slider("Search corridor around route (km)", 2, 25, 8,
+                                help="How far off the route to look for chargers.")
 
-    st.subheader("Open Charge Map")
-    api_key = st.text_input(
-        "API key", type="password",
-        help="Free key from openchargemap.org/site/develop. Works without "
-             "one but is rate-limited.")
+        if secret_key:
+            api_key = secret_key
+        else:
+            st.subheader("Open Charge Map")
+            api_key = st.text_input(
+                "API key", type="password",
+                help="Required — get a free key at "
+                     "openchargemap.org/site/develop, or add it to "
+                     ".streamlit/secrets.toml as ocm_api_key.")
 
-    go = st.button("Plan trip", type="primary", use_container_width=True)
+        go = st.form_submit_button("Plan trip", type="primary",
+                                   use_container_width=True)
+
+    if not api_key:
+        st.warning("Open Charge Map now requires an API key — without one, "
+                   "no chargers can be found.", icon="🔑")
 
     st.divider()
     st.caption("Data: OpenStreetMap (geocoding), OSRM (routing), "
@@ -69,6 +118,14 @@ def fmt_dur(minutes: float) -> str:
     minutes = int(round(minutes))
     h, m = divmod(minutes, 60)
     return f"{h}h {m:02d}m" if h else f"{m}m"
+
+
+def short_place(p: core.Place) -> str:
+    """Compact display name: first parts + country."""
+    parts = p.name.split(", ")
+    if len(parts) <= 4:
+        return p.name
+    return ", ".join(parts[:3]) + ", " + parts[-1]
 
 
 def power_color(kw: float) -> str:
@@ -97,34 +154,48 @@ def wait_color(band: str) -> str:
 
 st.markdown("## Trip plan")
 
-if not go:
+# The form button is only True for one rerun; remember that a plan was asked
+# for so results survive later widget interactions.
+if go:
+    st.session_state.planned = True
+
+if not st.session_state.get("planned"):
     st.info("Set your start, destination and EV range in the sidebar, then "
             "press **Plan trip**.")
     st.stop()
 
-with st.status("Planning your trip…", expanded=True) as status:
-    st.write("Geocoding start & destination…")
-    start = core.geocode(start_q)
-    end = core.geocode(end_q)
-    if not start or not end:
-        status.update(label="Couldn't find one of the places.", state="error")
-        st.error("Geocoding failed. Try a more specific place name.")
-        st.stop()
+# --- resolve locations (user-confirmable) ----------------------------------- #
 
-    st.write("Fetching driving route…")
-    route = core.get_route(start, end)
+with st.spinner("Looking up locations…"):
+    start_opts = find_places(start_q)
+    end_opts = find_places(end_q)
+
+if not start_opts or not end_opts:
+    which = "start" if not start_opts else "destination"
+    st.error(f"Couldn't find the {which} location. Try a more specific "
+             "place name (e.g. add the country).")
+    st.stop()
+
+# Let the user confirm *which* match was meant instead of trusting the top hit.
+ambiguous = len(start_opts) > 1 or len(end_opts) > 1
+with st.expander("📍 Confirm locations", expanded=ambiguous):
+    col_a, col_b = st.columns(2)
+    start = col_a.selectbox("Start", start_opts, format_func=short_place,
+                            key=f"sel_start::{start_q}")
+    end = col_b.selectbox("Destination", end_opts, format_func=short_place,
+                          key=f"sel_end::{end_q}")
+
+# --- route + plan (cached, so reruns and repeat plans are instant) ---------- #
+
+with st.spinner("Planning your trip…"):
+    route = find_route(start.lat, start.lon, end.lat, end.lon)
     if not route:
-        status.update(label="Routing failed.", state="error")
         st.error("Couldn't compute a driving route between these points.")
         st.stop()
+    trip = plan_trip(route, api_key, range_km, start_soc, corridor_km,
+                     min_power, battery_kwh)
 
-    st.write("Finding chargers & estimating waits…")
-    trip = core.build_trip(route, api_key, range_km, start_soc=start_soc,
-                           corridor_km=corridor_km, min_power_kw=min_power)
-    status.update(label="Trip planned.", state="complete")
-
-
-# --- summary metrics ------------------------------------------------------- #
+# --- summary metrics --------------------------------------------------------- #
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Distance", f"{route.distance_km:,.0f} km")
@@ -133,7 +204,12 @@ c3.metric("Charge stops", len(trip.stops))
 c4.metric("Charging + wait", fmt_dur(trip.total_charge_min + trip.total_wait_min))
 c5.metric("Total trip", fmt_dur(trip.total_trip_min))
 
-if not trip.reachable and not trip.stops:
+if trip.charger_error:
+    st.error(f"**Charger lookup failed** — {trip.charger_error}\n\n"
+             "Add a free Open Charge Map API key in the sidebar "
+             "(get one at https://openchargemap.org/site/develop) and plan "
+             "the trip again.")
+elif not trip.reachable and not trip.stops:
     st.warning("With this range and starting charge you can't complete the "
                "trip on the available fast chargers along the corridor. Try a "
                "wider search corridor, a lower minimum charger speed, or a "
@@ -143,11 +219,14 @@ elif trip.stops:
 else:
     st.success("No charging stop needed — this trip is within your range.")
 
-# --- map ------------------------------------------------------------------- #
+# --- map --------------------------------------------------------------------- #
 
-mid_lat = (start.lat + end.lat) / 2
-mid_lon = (start.lon + end.lon) / 2
-m = folium.Map(location=[mid_lat, mid_lon], zoom_start=6, tiles="cartodbpositron")
+m = folium.Map(tiles="cartodbpositron")
+# Zoom to the actual route rather than a fixed level, so short and long
+# trips both fill the frame.
+lats = [c[0] for c in route.coords]
+lons = [c[1] for c in route.coords]
+m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
 
 AntPath(locations=route.coords, color="#2563eb", weight=5, delay=1000).add_to(m)
 
@@ -165,13 +244,15 @@ for c in trip.corridor:
     ).add_to(m)
 
 # Planned stops as numbered, prominent markers.
-stop_ids = {s.id for s in trip.stops}
 for i, s in enumerate(trip.stops, 1):
     popup = folium.Popup(html=(
         f"<b>Stop {i}: {s.name}</b><br>"
         f"{s.town}<br>"
         f"{s.max_power_kw:.0f} kW · {s.num_points} bay(s)<br>"
-        f"~{s.dist_along_km:.0f} km along route<br>"
+        f"Bays open: ~{s.bays_open_est} of {s.num_points} (est.)<br>"
+        f"~{s.dist_along_km:.0f} km along route · "
+        f"{s.off_route_km:.1f} km off route<br>"
+        f"Charge ~{s.charge_time_min} min<br>"
         f"Status: {s.status_title}<br>"
         f"Wait: {s.wait_band} ({s.wait_source})"
     ), max_width=260)
@@ -183,16 +264,21 @@ for i, s in enumerate(trip.stops, 1):
 
 st_folium(m, use_container_width=True, height=520, returned_objects=[])
 
-# --- stop details ---------------------------------------------------------- #
+# --- stop details ------------------------------------------------------------ #
 
 if trip.stops:
     st.markdown("### Charging stops")
     for i, s in enumerate(trip.stops, 1):
         with st.container(border=True):
-            a, b, c, d = st.columns([3, 1.4, 1.4, 1.6])
+            a, b, c, d = st.columns([3, 1.4, 1.6, 1.6])
             a.markdown(f"**{i}. {s.name}**  \n{s.town or s.address or '—'}")
-            b.markdown(f"**{s.max_power_kw:.0f} kW**  \n{s.num_points} bay(s)")
-            c.markdown(f"**{s.dist_along_km:.0f} km**  \nalong route")
+            open_txt = (f"~{s.bays_open_est} of {s.num_points} open"
+                        if s.bays_open_est is not None
+                        else f"{s.num_points} bay(s)")
+            b.markdown(f"**{s.max_power_kw:.0f} kW**  \n{open_txt}")
+            c.markdown(f"**{s.dist_along_km:.0f} km** along  \n"
+                       f"+{s.off_route_km:.1f} km off route · "
+                       f"charge ~{s.charge_time_min} min")
             badge = wait_color(s.wait_band)
             wait_txt = (f"~{s.wait_minutes_est} min"
                         if s.wait_minutes_est is not None else s.wait_band)
@@ -203,7 +289,7 @@ if trip.stops:
                 f"{s.busyness_pct}%</small>",
                 unsafe_allow_html=True)
 
-# --- corridor table -------------------------------------------------------- #
+# --- corridor table ----------------------------------------------------------- #
 
 with st.expander(f"All {len(trip.corridor)} chargers near the route"):
     rows = [{
@@ -211,7 +297,9 @@ with st.expander(f"All {len(trip.corridor)} chargers near the route"):
         "Town": c.town,
         "Power (kW)": round(c.max_power_kw),
         "Bays": c.num_points,
+        "Open (est.)": ("—" if c.bays_open_est is None else c.bays_open_est),
         "Km along": round(c.dist_along_km),
+        "Km off route": round(c.off_route_km, 1),
         "Status": c.status_title,
         "Est. wait": (f"{c.wait_minutes_est} min"
                       if c.wait_minutes_est is not None else c.wait_band),

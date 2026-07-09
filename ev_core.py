@@ -34,6 +34,10 @@ USER_AGENT = "ev-route-planner/1.0 (personal project)"
 REQUEST_TIMEOUT = 20
 
 
+class ChargerAPIError(Exception):
+    """Open Charge Map request failed; message is safe to show the user."""
+
+
 # --------------------------------------------------------------------------- #
 # Data classes
 # --------------------------------------------------------------------------- #
@@ -72,6 +76,8 @@ class Charger:
     wait_minutes_est: Optional[int] = None
     wait_source: str = ""                      # "live" | "modelled"
     charge_time_min: int = 0
+    bays_open_est: Optional[int] = None        # modelled; 0 if out of service
+    off_route_km: float = 0.0                  # one-way distance off the route
 
 
 # --------------------------------------------------------------------------- #
@@ -118,26 +124,34 @@ def _min_dist_to_route_km(point: tuple[float, float],
 # External services
 # --------------------------------------------------------------------------- #
 
-def geocode(query: str) -> Optional[Place]:
-    """Resolve a place name / address to coordinates via Nominatim."""
+def geocode_candidates(query: str, limit: int = 5) -> list[Place]:
+    """
+    Resolve a place name to a ranked list of candidate places via Nominatim.
+    Multiple candidates let the UI confirm *which* "Springfield" was meant
+    instead of silently taking the top hit.
+    """
     if not query or not query.strip():
-        return None
+        return []
     try:
         resp = requests.get(
             NOMINATIM_URL,
-            params={"q": query, "format": "json", "limit": 1},
+            params={"q": query, "format": "json", "limit": limit},
             headers={"User-Agent": USER_AGENT},
             timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
         data = resp.json()
     except (requests.RequestException, ValueError):
-        return None
-    if not data:
-        return None
-    top = data[0]
-    return Place(name=top.get("display_name", query),
-                 lat=float(top["lat"]), lon=float(top["lon"]))
+        return []
+    return [Place(name=item.get("display_name", query),
+                  lat=float(item["lat"]), lon=float(item["lon"]))
+            for item in data]
+
+
+def geocode(query: str) -> Optional[Place]:
+    """Resolve a place name to the single best-match place (top candidate)."""
+    candidates = geocode_candidates(query, limit=1)
+    return candidates[0] if candidates else None
 
 
 def get_route(start: Place, end: Place) -> Optional[Route]:
@@ -203,11 +217,15 @@ def _parse_charger(poi: dict) -> Optional[Charger]:
     )
 
 
-def fetch_chargers_in_bbox(bbox, api_key: str, max_results: int = 500,
-                           country_code: str = "ZA") -> list[Charger]:
+def fetch_chargers_in_bbox(bbox, api_key: str, max_results: int = 2000,
+                           country_code: str = "") -> list[Charger]:
     """
     Single OCM call for a bounding box. OCM's boundingbox param wants
     (lat1,lon1),(lat2,lon2).
+
+    Raises ChargerAPIError with a user-readable message on failure — OCM
+    requires an API key, and a silent empty result here would masquerade
+    as "no chargers exist along this route".
     """
     min_lat, min_lon, max_lat, max_lon = bbox
     params = {
@@ -216,18 +234,30 @@ def fetch_chargers_in_bbox(bbox, api_key: str, max_results: int = 500,
         "maxresults": max_results,
         "compact": "true",
         "verbose": "false",
-        "key": api_key or "",
     }
+    if api_key:
+        params["key"] = api_key
     if country_code:
         params["countrycode"] = country_code
     try:
         resp = requests.get(OCM_URL, params=params,
                             headers={"User-Agent": USER_AGENT},
                             timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
+    except requests.RequestException as exc:
+        raise ChargerAPIError(f"Couldn't reach Open Charge Map: {exc}") from exc
+    if resp.status_code != 200:
+        # OCM returns plain-text reasons, e.g. "You must specify an API key"
+        # or "Invalid API key." — pass them through.
+        detail = resp.text.strip()[:200] or f"HTTP {resp.status_code}"
+        raise ChargerAPIError(f"Open Charge Map rejected the request: {detail}")
+    try:
         data = resp.json()
-    except (requests.RequestException, ValueError):
-        return []
+    except ValueError as exc:
+        raise ChargerAPIError("Open Charge Map returned an unreadable "
+                              "response.") from exc
+    if not isinstance(data, list):
+        raise ChargerAPIError(f"Open Charge Map returned an error: "
+                              f"{str(data)[:200]}")
     out = []
     for poi in data:
         c = _parse_charger(poi)
@@ -284,6 +314,7 @@ def estimate_wait(charger: Charger, when: Optional[datetime] = None) -> None:
         charger.wait_minutes_est = None
         charger.wait_source = "live"
         charger.charge_time_min = 0
+        charger.bays_open_est = 0
         return
 
     util = _busyness_factor(hour)
@@ -294,6 +325,11 @@ def estimate_wait(charger: Charger, when: Optional[datetime] = None) -> None:
     # Divisor keeps a single bay near the raw demand and damps multi-bay sites.
     per_bay_util = min(0.90, util / (0.7 + 0.5 * bays))
     charger.busyness_pct = int(round(per_bay_util * 100))
+
+    # Expected bays occupied right now = per-bay utilisation across all bays.
+    # Modelled, not measured — OCM's free API has no live occupancy.
+    in_use = min(bays, int(round(per_bay_util * bays)))
+    charger.bays_open_est = bays - in_use
 
     # Simple queueing-style expected wait: rises steeply as utilisation -> 1,
     # capped so a prototype estimate never returns an absurd number.
@@ -349,6 +385,7 @@ def chargers_along_route(route: Route, api_key: str,
         d, along = _min_dist_to_route_km((c.lat, c.lon), route.coords, cum)
         if d <= corridor_km and c.max_power_kw >= min_power_kw:
             c.dist_along_km = along
+            c.off_route_km = d
             estimate_wait(c)
             kept.append(c)
     kept.sort(key=lambda x: x.dist_along_km)
@@ -390,6 +427,30 @@ def plan_stops(route: Route, corridor_chargers: list[Charger],
     return stops
 
 
+def estimate_charge_times(stops: list[Charger], range_km: float,
+                          battery_kwh: float, start_soc: float = 0.9,
+                          taper: float = 0.75) -> None:
+    """
+    Set charge_time_min on each planned stop from the energy actually needed.
+
+    Simulates state-of-charge along the trip: arrive at each stop having spent
+    leg_km / range_km of battery, charge back to full (matching the planner's
+    assumption), at the charger's power damped by an average taper factor.
+    This replaces the flat per-speed session time, which ignored how empty
+    the car arrives.
+    """
+    soc = start_soc
+    prev_km = 0.0
+    for s in sorted(stops, key=lambda x: x.dist_along_km):
+        leg_km = s.dist_along_km - prev_km
+        soc_arrive = max(0.0, soc - leg_km / range_km)
+        energy_kwh = (1.0 - soc_arrive) * battery_kwh
+        avg_power_kw = max(10.0, s.max_power_kw) * taper
+        s.charge_time_min = int(round(energy_kwh / avg_power_kw * 60))
+        soc = 1.0
+        prev_km = s.dist_along_km
+
+
 # --------------------------------------------------------------------------- #
 # Trip summary
 # --------------------------------------------------------------------------- #
@@ -402,6 +463,7 @@ class TripPlan:
     reachable: bool
     total_charge_min: int = 0
     total_wait_min: int = 0
+    charger_error: str = ""            # non-empty if the OCM fetch failed
 
     @property
     def total_trip_min(self) -> float:
@@ -410,18 +472,30 @@ class TripPlan:
 
 def build_trip(route: Route, api_key: str, range_km: float,
                start_soc: float = 0.9, corridor_km: float = 8.0,
-               min_power_kw: float = 50.0) -> TripPlan:
-    corridor = chargers_along_route(route, api_key, corridor_km, min_power_kw=0.0)
+               min_power_kw: float = 50.0,
+               battery_kwh: Optional[float] = None) -> TripPlan:
+    # A failed charger fetch shouldn't kill the whole plan — short trips are
+    # still valid without charger data, so record the error and carry on.
+    charger_error = ""
+    try:
+        corridor = chargers_along_route(route, api_key, corridor_km,
+                                        min_power_kw=0.0)
+    except ChargerAPIError as exc:
+        corridor = []
+        charger_error = str(exc)
     stops = plan_stops(route, corridor, range_km, start_soc=start_soc,
                        min_power_kw=min_power_kw)
-    usable_full = range_km * 0.85
+    # Charge times from energy needed; ~0.18 kWh/km if no battery size given.
+    if battery_kwh is None:
+        battery_kwh = range_km * 0.18
+    estimate_charge_times(stops, range_km, battery_kwh, start_soc=start_soc)
     reachable = (range_km * (start_soc - 0.15) >= route.distance_km) or (
         len(stops) > 0 and _covers(route.distance_km, stops, range_km, start_soc))
     total_charge = sum(c.charge_time_min for c in stops)
     total_wait = sum(c.wait_minutes_est or 0 for c in stops)
     return TripPlan(route=route, stops=stops, corridor=corridor,
                     reachable=reachable, total_charge_min=total_charge,
-                    total_wait_min=total_wait)
+                    total_wait_min=total_wait, charger_error=charger_error)
 
 
 def _covers(total_km: float, stops: list[Charger], range_km: float,

@@ -78,6 +78,7 @@ class Charger:
     charge_time_min: int = 0
     bays_open_est: Optional[int] = None        # modelled; 0 if out of service
     off_route_km: float = 0.0                  # one-way distance off the route
+    dist_from_search_km: float = 0.0           # for "chargers near me" search
 
 
 # --------------------------------------------------------------------------- #
@@ -217,28 +218,18 @@ def _parse_charger(poi: dict) -> Optional[Charger]:
     )
 
 
-def fetch_chargers_in_bbox(bbox, api_key: str, max_results: int = 2000,
-                           country_code: str = "") -> list[Charger]:
+def _ocm_request(params: dict, api_key: str) -> list[Charger]:
     """
-    Single OCM call for a bounding box. OCM's boundingbox param wants
-    (lat1,lon1),(lat2,lon2).
+    Shared OCM GET with readable error handling.
 
     Raises ChargerAPIError with a user-readable message on failure — OCM
     requires an API key, and a silent empty result here would masquerade
-    as "no chargers exist along this route".
+    as "no chargers exist here".
     """
-    min_lat, min_lon, max_lat, max_lon = bbox
-    params = {
-        "output": "json",
-        "boundingbox": f"({min_lat},{min_lon}),({max_lat},{max_lon})",
-        "maxresults": max_results,
-        "compact": "true",
-        "verbose": "false",
-    }
+    params = {"output": "json", "compact": "true", "verbose": "false",
+              **params}
     if api_key:
         params["key"] = api_key
-    if country_code:
-        params["countrycode"] = country_code
     try:
         resp = requests.get(OCM_URL, params=params,
                             headers={"User-Agent": USER_AGENT},
@@ -258,12 +249,81 @@ def fetch_chargers_in_bbox(bbox, api_key: str, max_results: int = 2000,
     if not isinstance(data, list):
         raise ChargerAPIError(f"Open Charge Map returned an error: "
                               f"{str(data)[:200]}")
-    out = []
-    for poi in data:
-        c = _parse_charger(poi)
-        if c:
-            out.append(c)
-    return out
+    return [c for c in (_parse_charger(poi) for poi in data) if c]
+
+
+def fetch_chargers_in_bbox(bbox, api_key: str, max_results: int = 2000,
+                           country_code: str = "") -> list[Charger]:
+    """
+    Single OCM call for a bounding box. OCM's boundingbox param wants
+    (lat1,lon1),(lat2,lon2).
+    """
+    min_lat, min_lon, max_lat, max_lon = bbox
+    params = {
+        "boundingbox": f"({min_lat},{min_lon}),({max_lat},{max_lon})",
+        "maxresults": max_results,
+    }
+    if country_code:
+        params["countrycode"] = country_code
+    return _ocm_request(params, api_key)
+
+
+def fetch_chargers_near(lat: float, lon: float, radius_km: float,
+                        api_key: str, max_results: int = 100) -> list[Charger]:
+    """
+    Station-locator search: all chargers within `radius_km` of a point,
+    annotated with distance from the search point and wait estimates,
+    sorted nearest-first.
+    """
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "distance": radius_km,
+        "distanceunit": "KM",
+        "maxresults": max_results,
+    }
+    chargers = _ocm_request(params, api_key)
+    for c in chargers:
+        c.dist_from_search_km = haversine_km((lat, lon), (c.lat, c.lon))
+        estimate_wait(c)
+    chargers.sort(key=lambda x: x.dist_from_search_km)
+    return chargers
+
+
+# --------------------------------------------------------------------------- #
+# Station-locator presentation (Electrify-America-style tiers & availability)
+# --------------------------------------------------------------------------- #
+
+def power_tier(kw: float) -> str:
+    """Speed-tier label in the style charging networks use."""
+    if kw >= 350:
+        return "Hyper-Fast · 350 kW"
+    if kw >= 150:
+        return f"Ultra-Fast · {kw:.0f} kW"
+    if kw >= 50:
+        return f"Fast · {kw:.0f} kW"
+    if kw >= 22:
+        return f"AC Fast · {kw:.0f} kW"
+    return f"Level 2 · {kw:.0f} kW"
+
+
+def availability_label(c: Charger) -> str:
+    """
+    Station-card availability line, e.g. "3 of 4 likely open".
+    Live where OCM says out-of-service; otherwise from the modelled estimate.
+    """
+    if c.is_operational is False:
+        return "Out of service"
+    if c.bays_open_est is None:
+        return f"{c.num_points} bay(s)"
+    if c.bays_open_est == 0:
+        return f"Likely busy · 0 of {c.num_points} open"
+    return f"{c.bays_open_est} of {c.num_points} likely open"
+
+
+def directions_link(lat: float, lon: float) -> str:
+    """Google Maps turn-by-turn directions URL to a charger."""
+    return f"https://www.google.com/maps/dir/?api=1&destination={lat},{lon}"
 
 
 # --------------------------------------------------------------------------- #

@@ -1,11 +1,17 @@
 # ⚡ EV Route Planner
 
-A Streamlit app that plans a drive between two places and places fast-charging
-stops along the route based on your EV's range — with live station status
-(where available) and modelled wait-time estimates.
+A Streamlit app in the style of charging-network apps (à la Electrify
+America): find charging stations near you with availability and speed tiers,
+or plan a drive between two places with fast-charging stops placed along the
+route based on your EV's range — with live station status (where available)
+and modelled wait-time estimates.
 
 ## What it does
 
+- **Find a charger** — search stations around any address or city, filter by
+  speed tier and likely availability, and get per-station speed labels
+  (Hyper-Fast / Ultra-Fast / Fast / AC / Level 2), bays-likely-open counts,
+  wait estimates and one-tap Google Maps directions.
 - **Route** — geocodes your start and destination anywhere in the world
   (OpenStreetMap), lets you confirm which match you meant, and draws the
   actual driving route (OSRM).

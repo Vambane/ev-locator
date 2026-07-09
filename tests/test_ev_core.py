@@ -167,6 +167,60 @@ def test_charge_times_simulate_soc_across_stops():
 
 
 # --------------------------------------------------------------------------- #
+# Station-locator presentation
+# --------------------------------------------------------------------------- #
+
+def test_power_tiers():
+    assert core.power_tier(350).startswith("Hyper-Fast")
+    assert core.power_tier(150).startswith("Ultra-Fast")
+    assert core.power_tier(60).startswith("Fast")
+    assert core.power_tier(22).startswith("AC Fast")
+    assert core.power_tier(7).startswith("Level 2")
+
+
+def test_availability_label_out_of_service():
+    c = make_charger(1, 0, operational=False)
+    assert core.availability_label(c) == "Out of service"
+
+
+def test_availability_label_open_counts():
+    c = make_charger(1, 0, bays=4)
+    c.bays_open_est = 3
+    assert core.availability_label(c) == "3 of 4 likely open"
+    c.bays_open_est = 0
+    assert "Likely busy" in core.availability_label(c)
+
+
+def test_directions_link_contains_coords():
+    url = core.directions_link(-33.9, 18.4)
+    assert "-33.9,18.4" in url and url.startswith("https://")
+
+
+def test_fetch_near_sorts_by_distance(monkeypatch):
+    def fake_pois(*a, **k):
+        def poi(id_, lat, lon):
+            return {"ID": id_,
+                    "AddressInfo": {"Title": f"S{id_}", "Latitude": lat,
+                                    "Longitude": lon},
+                    "Connections": [{"PowerKW": 50}]}
+        # Deliberately out of distance order relative to (0, 0).
+        return FakeResponse(status_code=200, json_data=[
+            poi(1, 0.5, 0), poi(2, 0.1, 0), poi(3, 0.3, 0)])
+    monkeypatch.setattr(core.requests, "get", fake_pois)
+    out = core.fetch_chargers_near(0.0, 0.0, radius_km=100, api_key="k")
+    assert [c.id for c in out] == [2, 3, 1]
+    assert out[0].dist_from_search_km < out[1].dist_from_search_km
+    assert all(c.wait_band for c in out)   # wait model was applied
+
+
+def test_fetch_near_propagates_errors(monkeypatch):
+    monkeypatch.setattr(core.requests, "get", lambda *a, **k: FakeResponse(
+        status_code=403, text="Invalid API key."))
+    with pytest.raises(core.ChargerAPIError):
+        core.fetch_chargers_near(0.0, 0.0, radius_km=25, api_key="bad")
+
+
+# --------------------------------------------------------------------------- #
 # OCM fetch error handling (mocked — no network)
 # --------------------------------------------------------------------------- #
 

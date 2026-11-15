@@ -189,9 +189,22 @@ with st.sidebar:
             index=CONNECTOR_TYPES.index(st.session_state.vehicle_connector),
             help="Your EV's fast-charging connector type")
 
+    st.session_state.setdefault("recent_searches", [])
+    if st.session_state.recent_searches:
+        with st.expander("Recent searches", expanded=False):
+            for search in st.session_state.recent_searches[:5]:
+                st.caption(f"📍 {search}")
+
     st.divider()
     st.caption("Data: OpenStreetMap (geocoding), OSRM (routing), "
                "Open Charge Map (chargers). Wait times are estimates.")
+
+
+def add_recent_search(query: str):
+    """Add a search to recent history (max 5, no duplicates)."""
+    recent = st.session_state.get("recent_searches", [])
+    if query and query not in recent:
+        st.session_state.recent_searches = [query] + recent[:4]
 
 
 tab_find, tab_plan = st.tabs(["🔌 Find a charger", "🗺️ Plan a trip"])
@@ -221,6 +234,7 @@ with tab_find:
 
     if find_go:
         st.session_state.searched = True
+        add_recent_search(near_q)
 
     if not st.session_state.get("searched"):
         st.info("Search for charging stations near an address or city.")
@@ -356,6 +370,9 @@ with tab_plan:
 
         go = st.form_submit_button("Plan trip", type="primary",
                                    use_container_width=True)
+
+    if go:
+        add_recent_search(f"{start_q} → {end_q}")
 
     # The form button is only True for one rerun; remember that a plan was
     # asked for so results survive later widget interactions.

@@ -150,6 +150,26 @@ with st.sidebar:
                        "one, no chargers can be found.", icon="🔑")
 
     st.divider()
+
+    with st.expander("My Vehicle", expanded=False):
+        st.session_state.setdefault("vehicle_battery_kwh", 60.0)
+        st.session_state.setdefault("vehicle_range_km", 400.0)
+        st.session_state.setdefault("vehicle_connector", "CCS")
+
+        st.session_state.vehicle_battery_kwh = st.number_input(
+            "Battery size (kWh)", min_value=20.0, max_value=200.0,
+            value=st.session_state.vehicle_battery_kwh, step=5.0,
+            help="Your EV's usable battery capacity")
+        st.session_state.vehicle_range_km = st.number_input(
+            "Rated range (km)", min_value=100.0, max_value=800.0,
+            value=st.session_state.vehicle_range_km, step=10.0,
+            help="Manufacturer's rated range (we'll use 85% for planning)")
+        st.session_state.vehicle_connector = st.selectbox(
+            "My connector", CONNECTOR_TYPES,
+            index=CONNECTOR_TYPES.index(st.session_state.vehicle_connector),
+            help="Your EV's fast-charging connector type")
+
+    st.divider()
     st.caption("Data: OpenStreetMap (geocoding), OSRM (routing), "
                "Open Charge Map (chargers). Wait times are estimates.")
 
@@ -286,14 +306,16 @@ with tab_find:
 with tab_plan:
     with st.form("trip_form"):
         t1, t2 = st.columns(2)
-        start_q = t1.text_input("Start", value="Cape Town, South Africa")
-        end_q = t2.text_input("Destination",
-                              value="Bloemfontein, South Africa")
+        start_q = t1.text_input("Start", value="Cape Town")
+        end_q = t2.text_input("Destination", value="Johannesburg")
+
+        default_range = int(st.session_state.get("vehicle_range_km", 400))
+        default_battery = int(st.session_state.get("vehicle_battery_kwh", 60))
 
         e1, e2, e3 = st.columns(3)
-        range_km = e1.slider("Full range (km)", 150, 700, 350, step=10,
+        range_km = e1.slider("Full range (km)", 150, 700, default_range, step=10,
                              help="Rated range on a full charge.")
-        battery_kwh = e2.slider("Battery capacity (kWh)", 20, 150, 64,
+        battery_kwh = e2.slider("Battery capacity (kWh)", 20, 150, default_battery,
                                 help="Used to estimate charging time from "
                                      "the energy actually needed.")
         start_soc = e3.slider("Starting charge (%)", 30, 100, 90,

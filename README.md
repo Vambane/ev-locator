@@ -1,18 +1,21 @@
-# ⚡ EV Route Planner
+# ⚡ EV Charger SA
 
-A Streamlit app in the style of charging-network apps (à la Electrify
-America): find charging stations near you with availability and speed tiers,
-or plan a drive between two places with fast-charging stops placed along the
-route based on your EV's range — with live station status (where available)
-and modelled wait-time estimates.
+A Streamlit app for finding EV charging stations across **South Africa**.
+Find chargers near you with availability and speed tiers, filter by connector
+type (CCS, CHAdeMO, Type 2, Tesla), or plan a road trip with fast-charging
+stops placed along the route based on your EV's range — with live station
+status (where available) and modelled wait-time estimates.
+
+Data sourced from [Open Charge Map](https://openchargemap.org), which includes
+stations from GridCars, Charge, and other SA networks.
 
 ## What it does
 
-- **Find a charger** — search stations around any address or city, filter by
-  speed tier and likely availability, and get per-station speed labels
+- **Find a charger** — search stations around any SA address or city, filter by
+  speed tier, connector type, and likely availability, and get per-station speed labels
   (Hyper-Fast / Ultra-Fast / Fast / AC / Level 2), bays-likely-open counts,
   wait estimates and one-tap Google Maps directions.
-- **Route** — geocodes your start and destination anywhere in the world
+- **Route** — geocodes your start and destination within South Africa
   (OpenStreetMap), lets you confirm which match you meant, and draws the
   actual driving route (OSRM).
 - **Charging stops** — pulls chargers from Open Charge Map, filters to those

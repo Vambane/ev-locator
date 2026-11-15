@@ -1,0 +1,9 @@
+[project]
+name = "ev-charger-sa"
+version = "1.0.0"
+description = "Find EV charging stations across South Africa"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

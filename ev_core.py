@@ -125,18 +125,24 @@ def _min_dist_to_route_km(point: tuple[float, float],
 # External services
 # --------------------------------------------------------------------------- #
 
-def geocode_candidates(query: str, limit: int = 5) -> list[Place]:
+def geocode_candidates(query: str, limit: int = 5,
+                       country_code: str = "ZA") -> list[Place]:
     """
     Resolve a place name to a ranked list of candidate places via Nominatim.
     Multiple candidates let the UI confirm *which* "Springfield" was meant
     instead of silently taking the top hit.
+
+    Defaults to South Africa (ZA). Pass country_code="" for global search.
     """
     if not query or not query.strip():
         return []
+    params = {"q": query, "format": "json", "limit": limit}
+    if country_code:
+        params["countrycodes"] = country_code
     try:
         resp = requests.get(
             NOMINATIM_URL,
-            params={"q": query, "format": "json", "limit": limit},
+            params=params,
             headers={"User-Agent": USER_AGENT},
             timeout=REQUEST_TIMEOUT,
         )
@@ -269,11 +275,16 @@ def fetch_chargers_in_bbox(bbox, api_key: str, max_results: int = 2000,
 
 
 def fetch_chargers_near(lat: float, lon: float, radius_km: float,
-                        api_key: str, max_results: int = 100) -> list[Charger]:
+                        api_key: str, max_results: int = 100,
+                        country_code: str = "ZA",
+                        connector_types: list[str] | None = None) -> list[Charger]:
     """
     Station-locator search: all chargers within `radius_km` of a point,
     annotated with distance from the search point and wait estimates,
     sorted nearest-first.
+
+    Defaults to South Africa (ZA). Pass country_code="" for global.
+    Optional connector_types filters by connector (e.g., ["CCS", "CHAdeMO"]).
     """
     params = {
         "latitude": lat,
@@ -282,7 +293,15 @@ def fetch_chargers_near(lat: float, lon: float, radius_km: float,
         "distanceunit": "KM",
         "maxresults": max_results,
     }
+    if country_code:
+        params["countrycode"] = country_code
     chargers = _ocm_request(params, api_key)
+    if connector_types:
+        connector_types_lower = [ct.lower() for ct in connector_types]
+        chargers = [c for c in chargers
+                    if any(ct.lower() in conn.lower()
+                           for ct in connector_types_lower
+                           for conn in c.connectors)]
     for c in chargers:
         c.dist_from_search_km = haversine_km((lat, lon), (c.lat, c.lon))
         estimate_wait(c)

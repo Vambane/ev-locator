@@ -24,7 +24,9 @@ from streamlit_folium import st_folium
 
 import ev_core as core
 
-st.set_page_config(page_title="EV Route Planner", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="EV Charger SA", page_icon="⚡", layout="wide")
+
+CONNECTOR_TYPES = ["CCS", "CHAdeMO", "Type 2", "Tesla"]
 
 # --------------------------------------------------------------------------- #
 # Cached data access — identical inputs never re-hit the free public APIs.
@@ -57,9 +59,13 @@ def plan_trip(route: core.Route, api_key: str, range_km: float,
 
 @st.cache_data(ttl=120, show_spinner=False)
 def chargers_near(lat: float, lon: float, radius_km: float,
-                  api_key: str) -> list[core.Charger]:
+                  api_key: str,
+                  connector_types: tuple[str, ...] = ()) -> list[core.Charger]:
     """Nearby-station search. Short TTL keeps availability estimates fresh."""
-    return core.fetch_chargers_near(lat, lon, radius_km, api_key)
+    return core.fetch_chargers_near(
+        lat, lon, radius_km, api_key,
+        connector_types=list(connector_types) if connector_types else None
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -126,9 +132,9 @@ except (FileNotFoundError, st.errors.StreamlitAPIException):
     secret_key = ""
 
 with st.sidebar:
-    st.title("⚡ EV Route Planner")
-    st.caption("Find chargers near you, or plan a road trip with "
-               "charging stops.")
+    st.title("⚡ EV Charger SA")
+    st.caption("Find EV charging stations across South Africa, or plan a "
+               "road trip with charging stops.")
 
     if secret_key:
         api_key = secret_key
@@ -156,14 +162,19 @@ tab_find, tab_plan = st.tabs(["🔌 Find a charger", "🗺️ Plan a trip"])
 
 with tab_find:
     with st.form("find_form"):
-        f1, f2, f3, f4 = st.columns([3, 1.2, 1.4, 1.4])
-        near_q = f1.text_input("Near", value="Cape Town, South Africa",
-                               help="Address, suburb or city to search around.")
+        f1, f2 = st.columns([3, 1.2])
+        near_q = f1.text_input("Near", value="Cape Town",
+                               help="Address, suburb or city in South Africa.")
         radius_km = f2.slider("Radius (km)", 5, 100, 25)
+
+        f3, f4, f5 = st.columns([1.4, 1.8, 1.4])
         find_min_kw = f3.select_slider("Min speed (kW)",
                                        options=[0, 22, 50, 100, 150, 350],
                                        value=0)
-        hide_busy = f4.checkbox("Only likely available", value=False,
+        connector_filter = f4.multiselect("Connector types", CONNECTOR_TYPES,
+                                          default=[],
+                                          help="Leave empty for all types")
+        hide_busy = f5.checkbox("Only likely available", value=False,
                                 help="Hide out-of-service stations and those "
                                      "with no bays likely open.")
         find_go = st.form_submit_button("Search", type="primary")
@@ -185,8 +196,10 @@ with tab_find:
 
         with st.spinner("Finding chargers…"):
             try:
-                stations = chargers_near(centre.lat, centre.lon,
-                                         float(radius_km), api_key)
+                stations = chargers_near(
+                    centre.lat, centre.lon, float(radius_km), api_key,
+                    connector_types=tuple(connector_filter) if connector_filter else ()
+                )
             except core.ChargerAPIError as exc:
                 st.error(f"**Charger lookup failed** — {exc}\n\n"
                          "Add a free Open Charge Map API key in the sidebar "

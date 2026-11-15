@@ -16,6 +16,7 @@ Run:
 from __future__ import annotations
 
 from datetime import datetime
+from urllib.parse import urlencode
 
 import folium
 import streamlit as st
@@ -27,6 +28,25 @@ import ev_core as core
 st.set_page_config(page_title="EV Charger SA", page_icon="⚡", layout="wide")
 
 CONNECTOR_TYPES = ["CCS", "CHAdeMO", "Type 2", "Tesla"]
+
+# --------------------------------------------------------------------------- #
+# URL query params for shareable routes
+# --------------------------------------------------------------------------- #
+
+def get_query_params() -> dict:
+    """Read URL query params for pre-filling trip form."""
+    params = st.query_params
+    return {
+        "start": params.get("start", ""),
+        "end": params.get("end", ""),
+        "range": int(params.get("range", 0)) if params.get("range") else 0,
+        "battery": int(params.get("battery", 0)) if params.get("battery") else 0,
+    }
+
+def make_share_url(start: str, end: str, range_km: int, battery_kwh: int) -> str:
+    """Generate a shareable URL with trip params."""
+    params = {"start": start, "end": end, "range": range_km, "battery": battery_kwh}
+    return f"?{urlencode(params)}"
 
 # --------------------------------------------------------------------------- #
 # Cached data access — identical inputs never re-hit the free public APIs.
@@ -304,13 +324,17 @@ with tab_find:
 # =========================================================================== #
 
 with tab_plan:
+    url_params = get_query_params()
+
     with st.form("trip_form"):
         t1, t2 = st.columns(2)
-        start_q = t1.text_input("Start", value="Cape Town")
-        end_q = t2.text_input("Destination", value="Johannesburg")
+        start_q = t1.text_input("Start", value=url_params["start"] or "Cape Town")
+        end_q = t2.text_input("Destination", value=url_params["end"] or "Johannesburg")
 
-        default_range = int(st.session_state.get("vehicle_range_km", 400))
-        default_battery = int(st.session_state.get("vehicle_battery_kwh", 60))
+        default_range = (url_params["range"] or
+                         int(st.session_state.get("vehicle_range_km", 400)))
+        default_battery = (url_params["battery"] or
+                           int(st.session_state.get("vehicle_battery_kwh", 60)))
 
         e1, e2, e3 = st.columns(3)
         range_km = e1.slider("Full range (km)", 150, 700, default_range, step=10,
@@ -384,6 +408,10 @@ with tab_plan:
     c4.metric("Charging + wait",
               fmt_dur(trip.total_charge_min + trip.total_wait_min))
     c5.metric("Total trip", fmt_dur(trip.total_trip_min))
+
+    share_url = make_share_url(start_q, end_q, range_km, battery_kwh)
+    st.markdown(f"**Share this route:** `{share_url}`",
+                help="Copy this URL to share your planned route")
 
     if trip.charger_error:
         st.error(f"**Charger lookup failed** — {trip.charger_error}\n\n"
